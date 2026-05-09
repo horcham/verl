@@ -945,6 +945,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_adaptive_lr_scheduler(self, decay_period: int):
+        """
+        Update the adaptive step-decay scheduler with new decay_period.
+
+        Called from driver when response length surge is detected during training.
+        Rebuilds the LR scheduler with the computed decay_period.
+
+        Args:
+            decay_period: Steps between LR halving (computed as 1.8 * surge_step)
+        """
+        if not self._is_actor:
+            return
+
+        # Update optimizer config with new decay_period
+        self.actor_optimizer_config.decay_period = decay_period
+        self.actor_optimizer_config.surge_detected = True
+
+        # Rebuild scheduler with new decay_period
+        self.actor_lr_scheduler = self.actor_engine._build_lr_scheduler(self.actor_optimizer)
+
+        if self.rank == 0:
+            print(f"[Worker] Updated adaptive LR scheduler with decay_period={decay_period}")
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
@@ -1590,6 +1614,30 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         output = output.to("cpu")
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_adaptive_lr_scheduler(self, decay_period: int):
+        """
+        Update the critic's adaptive step-decay scheduler with new decay_period.
+
+        Called from driver when response length surge is detected during training.
+        Rebuilds the LR scheduler with the computed decay_period.
+
+        Args:
+            decay_period: Steps between LR halving (computed as 1.8 * surge_step)
+        """
+        if not self._is_critic:
+            return
+
+        # Update optimizer config with new decay_period
+        self.critic_optimizer_config.decay_period = decay_period
+        self.critic_optimizer_config.surge_detected = True
+
+        # Rebuild scheduler with new decay_period
+        self.critic_lr_scheduler = self.critic_engine._build_lr_scheduler(self.critic_optimizer)
+
+        if self.rank == 0:
+            print(f"[Critic Worker] Updated adaptive LR scheduler with decay_period={decay_period}")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

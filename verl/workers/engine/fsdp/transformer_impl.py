@@ -390,7 +390,11 @@ class FSDPEngine(BaseEngine):
         return optimizer
 
     def _build_lr_scheduler(self, optimizer):
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+        from verl.utils.torch_functional import (
+            get_constant_schedule_with_warmup,
+            get_cosine_schedule_with_warmup,
+            get_adaptive_step_decay_schedule,
+        )
 
         optim_config = self.optimizer_config
 
@@ -416,6 +420,17 @@ class FSDPEngine(BaseEngine):
                 min_lr_ratio=min_lr_ratio,
                 num_cycles=num_cycles,
             )
+        elif lr_scheduler_type == "adaptive_step_decay":
+            # Get decay_period from config (may be -1 if not yet detected)
+            decay_period = optim_config.get("decay_period", -1)
+            lr_scheduler = get_adaptive_step_decay_schedule(
+                optimizer=optimizer,
+                num_warmup_steps=num_warmup_steps,
+                decay_period=decay_period,
+                min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.1,
+            )
+            if self.rank == 0:
+                print(f"Adaptive Step-Decay scheduler created with decay_period={decay_period}")
         else:
             raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
         return lr_scheduler

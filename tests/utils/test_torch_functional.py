@@ -115,3 +115,155 @@ def test_distributed_masked_mean(world_size, tmp_path):
         nprocs=world_size,
         join=True,
     )
+
+
+# Tests for Adaptive Step-Decay scheduler
+def test_adaptive_step_decay_halving():
+    """Test that LR halves at correct decay_period intervals."""
+    from torch.optim import AdamW
+    from verl.utils.torch_functional import get_adaptive_step_decay_schedule
+
+    optimizer = AdamW([torch.randn(10, requires_grad=True)], lr=1e-3)
+    scheduler = get_adaptive_step_decay_schedule(
+        optimizer, num_warmup_steps=10, decay_period=20, min_lr_ratio=0.1
+    )
+
+    # Warmup phase: LR should increase from 0 to 1e-3
+    warmup_lrs = []
+    for step in range(10):
+        scheduler.step()
+        warmup_lrs.append(scheduler.get_last_lr()[0])
+
+    # LR should be increasing during warmup
+    assert warmup_lrs[0] < warmup_lrs[-1], "LR should increase during warmup"
+    assert warmup_lrs[-1] < 1e-3, "LR should be below initial during warmup"
+
+    # Step 10: First step after warmup, LR = 1e-3
+    scheduler.step()
+    assert scheduler.get_last_lr()[0] == 1e-3, f"LR should be 1e-3 after warmup, got {scheduler.get_last_lr()[0]}"
+
+    # Steps 11-30: LR should stay at 1e-3 (within first decay_period)
+    for _ in range(20):
+        scheduler.step()
+    assert scheduler.get_last_lr()[0] == 5e-4, f"LR should be 5e-4 after first halving, got {scheduler.get_last_lr()[0]}"
+
+    # Steps 31-50: LR should halve to 2.5e-4
+    for _ in range(20):
+        scheduler.step()
+    assert scheduler.get_last_lr()[0] == 2.5e-4, f"LR should be 2.5e-4 after second halving, got {scheduler.get_last_lr()[0]}"
+
+
+def test_adaptive_step_decay_min_lr_floor():
+    """Test that LR doesn't go below min_lr_ratio."""
+    from torch.optim import AdamW
+    from verl.utils.torch_functional import get_adaptive_step_decay_schedule
+
+    optimizer = AdamW([torch.randn(10, requires_grad=True)], lr=1e-3)
+    scheduler = get_adaptive_step_decay_schedule(
+        optimizer, num_warmup_steps=0, decay_period=10, min_lr_ratio=0.1
+    )
+
+    # After many halvings, LR should stay at 1e-4 (10% of 1e-3)
+    for _ in range(1000):
+        scheduler.step()
+
+    min_lr = 1e-4
+    actual_lr = scheduler.get_last_lr()[0]
+    assert actual_lr >= min_lr, f"LR should not go below {min_lr}, got {actual_lr}"
+    assert actual_lr == min_lr, f"LR should stabilize at {min_lr}, got {actual_lr}"
+
+
+def test_adaptive_step_decay_uninitialized():
+    """Test that scheduler stays constant when decay_period=-1."""
+    from torch.optim import AdamW
+    from verl.utils.torch_functional import get_adaptive_step_decay_schedule
+
+    optimizer = AdamW([torch.randn(10, requires_grad=True)], lr=1e-3)
+    scheduler = get_adaptive_step_decay_schedule(
+        optimizer, num_warmup_steps=10, decay_period=-1
+    )
+
+    # Warmup phase
+    for _ in range(10):
+        scheduler.step()
+
+    # After warmup, LR should stay constant since decay_period=-1
+    lr_after_warmup = scheduler.get_last_lr()[0]
+    for _ in range(100):
+        scheduler.step()
+
+    lr_final = scheduler.get_last_lr()[0]
+    assert lr_after_warmup == lr_final == 1e-3, f"LR should stay at 1e-3 when decay_period=-1, got {lr_final}"
+
+
+def test_adaptive_step_decay_warmup():
+    """Test warmup phase behavior."""
+    from torch.optim import AdamW
+    from verl.utils.torch_functional import get_adaptive_step_decay_schedule
+
+    optimizer = AdamW([torch.randn(10, requires_grad=True)], lr=1e-3)
+    num_warmup_steps = 100
+    scheduler = get_adaptive_step_decay_schedule(
+        optimizer, num_warmup_steps=num_warmup_steps, decay_period=50
+    )
+
+    # Check LR increases linearly during warmup
+    prev_lr = 0.0
+    for step in range(num_warmup_steps):
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        assert current_lr > prev_lr, f"LR should increase at step {step}"
+        prev_lr = current_lr
+
+    # After warmup, LR should be exactly initial LR
+    scheduler.step()
+    assert scheduler.get_last_lr()[0] == 1e-3, f"LR after warmup should be 1e-3"
+
+
+def test_adaptive_step_decay_ratio_sequence():
+    """Test the exact halving sequence."""
+    from torch.optim import AdamW
+    from verl.utils.torch_functional import get_adaptive_step_decay_schedule
+
+    initial_lr = 1e-3
+    optimizer = AdamW([torch.randn(10, requires_grad=True)], lr=initial_lr)
+    decay_period = 20
+    scheduler = get_adaptive_step_decay_schedule(
+        optimizer, num_warmup_steps=0, decay_period=decay_period, min_lr_ratio=0.125  # 12.5%
+    )
+
+    expected_lrs = [
+        1e-3,  # 0 halvings
+        5e-4,  # 1 halving (step 20)
+        2.5e-4,  # 2 halvings (step 40)
+        1.25e-4,  # 3 halvings (step 60) - this is 12.5%, should stop here
+    ]
+
+    # Step through and verify each halving point
+    step = 0
+    scheduler.step()  # Step 1, LR = initial
+    assert scheduler.get_last_lr()[0] == expected_lrs[0]
+
+    # First decay_period
+    for _ in range(decay_period):
+        scheduler.step()
+    step += decay_period + 1
+    assert scheduler.get_last_lr()[0] == expected_lrs[1], f"LR after {step} steps should be {expected_lrs[1]}"
+
+    # Second decay_period
+    for _ in range(decay_period):
+        scheduler.step()
+    step += decay_period
+    assert scheduler.get_last_lr()[0] == expected_lrs[2], f"LR after {step} steps should be {expected_lrs[2]}"
+
+    # Third decay_period - should stop at min_lr_ratio
+    for _ in range(decay_period):
+        scheduler.step()
+    step += decay_period
+    assert scheduler.get_last_lr()[0] == expected_lrs[3], f"LR after {step} steps should be {expected_lrs[3]}"
+
+    # Fourth decay_period - should stay at min_lr_ratio
+    for _ in range(decay_period):
+        scheduler.step()
+    step += decay_period
+    assert scheduler.get_last_lr()[0] == expected_lrs[3], f"LR should stay at min_lr_ratio {expected_lrs[3]}"

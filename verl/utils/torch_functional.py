@@ -757,6 +757,69 @@ def get_constant_schedule_with_warmup(
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
+def get_adaptive_step_decay_schedule(
+    optimizer: Optimizer,
+    num_warmup_steps: int,
+    decay_period: int = -1,
+    min_lr_ratio: float = 0.1,
+    last_epoch: int = -1,
+):
+    """
+    Create an Adaptive Step-Decay schedule with warmup.
+
+    The learning rate schedule follows:
+    1. Warmup phase: LR increases linearly from 0 to initial LR
+    2. Constant phase: LR stays at initial LR if decay_period is not set (decay_period=-1)
+    3. Decay phase: LR halves every decay_period steps after warmup
+    4. Minimum floor: LR stops decaying at min_lr_ratio * initial LR
+
+    This scheduler is designed for RL training where response length surge
+    indicates potential training instability. The decay_period is dynamically
+    set when surge is detected: decay_period = 1.8 * surge_step.
+
+    Args:
+        optimizer (:class:`~torch.optim.Optimizer`):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (:obj:`int`):
+            The number of steps for the warmup phase.
+        decay_period (:obj:`int`, `optional`, defaults to -1):
+            Steps between LR halving. -1 means not yet set (awaiting surge detection).
+            When set to a positive value, LR will halve every decay_period steps.
+        min_lr_ratio (:obj:`float`, `optional`, defaults to 0.1):
+            The minimum LR ratio w.r.t the initial LR. LR will not decay below this.
+        last_epoch (:obj:`int`, `optional`, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Return:
+        :obj:`torch.optim.lr_scheduler.LambdaLR` with the adaptive step-decay schedule.
+
+    Example:
+        # Before surge detection (decay_period=-1): LR stays constant after warmup
+        scheduler = get_adaptive_step_decay_schedule(optimizer, num_warmup_steps=10, decay_period=-1)
+
+        # After surge detected at step 110: set decay_period = 1.8 * 110 = 198
+        # Rebuild scheduler with decay_period=198
+        scheduler = get_adaptive_step_decay_schedule(optimizer, num_warmup_steps=10, decay_period=198)
+    """
+
+    def lr_lambda(current_step):
+        # Warmup phase: linear increase from 0 to 1
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+
+        # Decay phase: halve LR every decay_period steps (if set)
+        if decay_period > 0:
+            steps_since_warmup = current_step - num_warmup_steps
+            num_halvings = steps_since_warmup // decay_period
+            decayed_ratio = 1.0 / (2 ** num_halvings)
+            return max(min_lr_ratio, decayed_ratio)
+
+        # Decay period not yet set: maintain constant LR
+        return 1.0
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
 def prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds):
     # create causal mask
     # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]

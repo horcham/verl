@@ -253,11 +253,36 @@ class MegatronEngine(BaseEngine):
         return optimizer
 
     def _build_lr_scheduler(self):
-        from verl.utils.megatron.optimizer import get_megatron_optimizer_param_scheduler
-
-        optimizer_scheduler = get_megatron_optimizer_param_scheduler(
-            optimizer=self.optimizer, config=self.optimizer_config
+        from verl.utils.megatron.optimizer import (
+            get_megatron_optimizer_param_scheduler,
+            AdaptiveStepDecayScheduler,
         )
+
+        # Check if adaptive step-decay is requested
+        lr_decay_style = self.optimizer_config.get("lr_decay_style", "linear")
+        if lr_decay_style == "adaptive_step":
+            # Use AdaptiveStepDecayScheduler wrapper
+            decay_period = self.optimizer_config.get("decay_period", -1)
+            min_lr_ratio = (
+                self.optimizer_config.get("min_lr_ratio", 0.1)
+                if self.optimizer_config.get("min_lr_ratio") is not None
+                else self.optimizer_config.min_lr / self.optimizer_config.lr
+                if self.optimizer_config.min_lr > 0
+                else 0.1
+            )
+            optimizer_scheduler = AdaptiveStepDecayScheduler(
+                optimizer=self.optimizer,
+                config=self.optimizer_config,
+                decay_period=decay_period,
+                min_lr_ratio=min_lr_ratio,
+            )
+            if torch.distributed.get_rank() == 0:
+                print(f"[Megatron] AdaptiveStepDecayScheduler created with decay_period={decay_period}")
+        else:
+            # Use standard Megatron scheduler
+            optimizer_scheduler = get_megatron_optimizer_param_scheduler(
+                optimizer=self.optimizer, config=self.optimizer_config
+            )
         return optimizer_scheduler
 
     @property

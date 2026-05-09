@@ -21,7 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
@@ -352,6 +352,14 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+
+        # Initialize Adaptive Step-Decay surge detection tracking
+        self.response_length_history = deque(
+            maxlen=self.config.algorithm.get("surge_baseline_window", 100)
+        )
+        self.surge_baseline = None
+        self.surge_detected_step = -1
+        self.last_surge_check_step = -1
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -988,6 +996,23 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        # Save Adaptive Step-Decay state if enabled
+        lr_scheduler_type = self.config.algorithm.get("lr_scheduler_type", None)
+        if lr_scheduler_type == "adaptive_step_decay":
+            import json
+            adaptive_state = {
+                "surge_detected": self.surge_detected_step > 0,
+                "surge_step": self.surge_detected_step,
+                "decay_period": self.config.algorithm.get("decay_period", -1),
+                "surge_baseline": self.surge_baseline,
+                "response_length_history": list(self.response_length_history),
+                "last_surge_check_step": self.last_surge_check_step,
+            }
+            adaptive_state_path = os.path.join(local_global_step_folder, "adaptive_step_decay_state.json")
+            with open(adaptive_state_path, "w") as f:
+                json.dump(adaptive_state, f)
+            print(f"[Adaptive Step-Decay] Saved state to {adaptive_state_path}")
+
         # latest checkpointed iteration tracker (for atomic usage)
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -1060,6 +1085,44 @@ class RayPPOTrainer:
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+        # Load Adaptive Step-Decay state if enabled
+        lr_scheduler_type = self.config.algorithm.get("lr_scheduler_type", None)
+        if lr_scheduler_type == "adaptive_step_decay":
+            import json
+            adaptive_state_path = os.path.join(global_step_folder, "adaptive_step_decay_state.json")
+            if os.path.exists(adaptive_state_path):
+                with open(adaptive_state_path, "r") as f:
+                    adaptive_state = json.load(f)
+
+                self.surge_detected_step = adaptive_state["surge_step"]
+                self.surge_baseline = adaptive_state["surge_baseline"]
+                self.response_length_history = deque(
+                    adaptive_state["response_length_history"],
+                    maxlen=self.config.algorithm.get("surge_baseline_window", 100)
+                )
+                self.last_surge_check_step = adaptive_state["last_surge_check_step"]
+
+                # Restore decay_period to config if surge was detected
+                if adaptive_state["surge_detected"]:
+                    decay_period = adaptive_state["decay_period"]
+                    self.config.algorithm.decay_period = decay_period
+                    self.config.algorithm.surge_detected = True
+                    self.config.algorithm.surge_step = self.surge_detected_step
+
+                    # Update workers' scheduler with restored decay_period
+                    try:
+                        self.actor_rollout_wg.update_adaptive_lr_scheduler(decay_period=decay_period)
+                        if self.use_critic:
+                            self.critic_wg.update_adaptive_lr_scheduler(decay_period=decay_period)
+                        print(
+                            f"[Adaptive Step-Decay] Restored state: surge_step={self.surge_detected_step}, "
+                            f"decay_period={decay_period}, baseline={self.surge_baseline:.1f}"
+                        )
+                    except Exception as e:
+                        print(f"[Adaptive Step-Decay] Failed to restore scheduler state: {e}")
+            else:
+                print(f"[Adaptive Step-Decay] No state file found at {adaptive_state_path}")
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1268,6 +1331,71 @@ class RayPPOTrainer:
         else:
             critic_output = self.critic_wg.update_critic(batch)
         return critic_output
+
+    def _check_response_length_surge(self, metrics: dict, global_steps: int) -> tuple[bool, int]:
+        """
+        Check if response length has surged above threshold for Adaptive Step-Decay.
+
+        Algorithm (from paper arXiv:2602.01826v1):
+        - Monitor response_length/mean during training
+        - Compute baseline from first N steps after critic warmup
+        - Detect surge when response_length > baseline * surge_threshold_multiplier
+        - When surge detected, set decay_period = 1.8 * surge_step
+
+        Args:
+            metrics: Dictionary containing metrics including response_length/mean
+            global_steps: Current training step
+
+        Returns:
+            (surge_detected, surge_step) tuple:
+            - surge_detected: True if surge threshold exceeded
+            - surge_step: The step at which surge was detected (-1 if not detected)
+        """
+        # Skip if surge already detected
+        if self.surge_detected_step > 0:
+            return False, -1
+
+        # Get current response length from metrics
+        response_length_mean = metrics.get("response_length/mean", None)
+        if response_length_mean is None:
+            return False, -1
+
+        # Update response length history
+        self.response_length_history.append(response_length_mean)
+
+        # Get configuration parameters
+        surge_baseline_window = self.config.algorithm.get("surge_baseline_window", 50)
+        surge_threshold_multiplier = self.config.algorithm.get("surge_threshold_multiplier", 3.0)
+        surge_cooldown_steps = self.config.algorithm.get("surge_cooldown_steps", 50)
+
+        # Need enough history for baseline computation
+        if len(self.response_length_history) < surge_baseline_window:
+            return False, -1
+
+        # Compute baseline (mean of first N steps after critic warmup)
+        critic_warmup = self.config.trainer.get("critic_warmup", 0)
+        if self.surge_baseline is None:
+            # Use first window as baseline after critic warmup phase
+            if global_steps > critic_warmup + surge_baseline_window:
+                history_list = list(self.response_length_history)
+                # Use first surge_baseline_window samples for baseline
+                self.surge_baseline = sum(history_list[:surge_baseline_window]) / surge_baseline_window
+
+        if self.surge_baseline is None:
+            return False, -1
+
+        # Check cooldown to avoid spurious detections
+        if self.last_surge_check_step >= 0 and global_steps - self.last_surge_check_step < surge_cooldown_steps:
+            return False, -1
+
+        # Check surge threshold
+        threshold = self.surge_baseline * surge_threshold_multiplier
+        if response_length_mean > threshold:
+            self.surge_detected_step = global_steps
+            self.last_surge_check_step = global_steps
+            return True, global_steps
+
+        return False, -1
 
     def fit(self):
         """
@@ -1628,6 +1756,38 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+
+                # Adaptive Step-Decay: Check for response length surge
+                # This is triggered when lr_scheduler_type is "adaptive_step_decay"
+                lr_scheduler_type = self.config.algorithm.get("lr_scheduler_type", None)
+                if lr_scheduler_type == "adaptive_step_decay":
+                    surge_detected, surge_step = self._check_response_length_surge(metrics, self.global_steps)
+                    if surge_detected:
+                        # Compute decay_period = 1.8 * surge_step (from paper)
+                        decay_period = int(1.8 * surge_step)
+
+                        # Update algorithm config with detected surge parameters
+                        self.config.algorithm.decay_period = decay_period
+                        self.config.algorithm.surge_detected = True
+                        self.config.algorithm.surge_step = surge_step
+
+                        # Log surge detection metrics
+                        metrics["adaptive_step_decay/surge_detected"] = surge_step
+                        metrics["adaptive_step_decay/decay_period"] = decay_period
+                        metrics["adaptive_step_decay/baseline"] = self.surge_baseline
+
+                        # Update workers' LR scheduler with new decay_period via RPC
+                        # This rebuilds the scheduler with the computed decay_period
+                        try:
+                            self.actor_rollout_wg.update_adaptive_lr_scheduler(decay_period=decay_period)
+                            if self.use_critic:
+                                self.critic_wg.update_adaptive_lr_scheduler(decay_period=decay_period)
+                            print(
+                                f"[Adaptive Step-Decay] Surge detected at step {surge_step}, "
+                                f"decay_period={decay_period}, baseline={self.surge_baseline:.1f}"
+                            )
+                        except Exception as e:
+                            print(f"[Adaptive Step-Decay] Failed to update scheduler: {e}")
 
                 progress_bar.update(1)
                 self.global_steps += 1

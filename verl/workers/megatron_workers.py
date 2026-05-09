@@ -762,6 +762,34 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
         return output
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_adaptive_lr_scheduler(self, decay_period: int):
+        """
+        Update the adaptive step-decay scheduler with new decay_period for Megatron backend.
+
+        Called from driver when response length surge is detected during training.
+        Updates the scheduler's decay_period parameter.
+
+        Args:
+            decay_period: Steps between LR halving (computed as 1.8 * surge_step)
+        """
+        if not self._is_actor:
+            return
+
+        # Update optimizer config with new decay_period
+        self.actor_optimizer_config.decay_period = decay_period
+        self.actor_optimizer_config.surge_detected = True
+
+        # For Megatron, update the scheduler's decay_period if it's AdaptiveStepDecayScheduler
+        if hasattr(self.actor_optimizer_scheduler, "update_decay_period"):
+            self.actor_optimizer_scheduler.update_decay_period(decay_period)
+        else:
+            # Rebuild scheduler with new decay_period
+            self.actor_optimizer_scheduler = self.actor_engine._build_lr_scheduler()
+
+        if torch.distributed.get_rank() == 0:
+            print(f"[Megatron Worker] Updated adaptive LR scheduler with decay_period={decay_period}")
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @GPUMemoryLogger(role="generate_sequences", logger=logger)
     @DistProfiler.annotate(color="red", role="rollout_generate")
@@ -1254,6 +1282,34 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
             offload_megatron_optimizer(self.critic_optimizer)
         output = output.to("cpu")
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_adaptive_lr_scheduler(self, decay_period: int):
+        """
+        Update the critic's adaptive step-decay scheduler with new decay_period for Megatron backend.
+
+        Called from driver when response length surge is detected during training.
+        Updates the scheduler's decay_period parameter.
+
+        Args:
+            decay_period: Steps between LR halving (computed as 1.8 * surge_step)
+        """
+        if not self._is_critic:
+            return
+
+        # Update optimizer config with new decay_period
+        self.critic_optimizer_config.decay_period = decay_period
+        self.critic_optimizer_config.surge_detected = True
+
+        # For Megatron, update the scheduler's decay_period if it's AdaptiveStepDecayScheduler
+        if hasattr(self.critic_optimizer_scheduler, "update_decay_period"):
+            self.critic_optimizer_scheduler.update_decay_period(decay_period)
+        else:
+            # Rebuild scheduler with new decay_period
+            self.critic_optimizer_scheduler = self.critic_engine._build_lr_scheduler()
+
+        if torch.distributed.get_rank() == 0:
+            print(f"[Megatron Critic Worker] Updated adaptive LR scheduler with decay_period={decay_period}")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, checkpoint_path, hdfs_path=None, del_local_after_load=True):

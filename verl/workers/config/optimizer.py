@@ -19,7 +19,7 @@ from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
 
-__all__ = ["OptimizerConfig", "FSDPOptimizerConfig", "McoreOptimizerConfig", "build_optimizer", "VeOmniOptimizerConfig"]
+__all__ = ["OptimizerConfig", "FSDPOptimizerConfig", "McoreOptimizerConfig", "build_optimizer", "VeOmniOptimizerConfig", "AdaptiveStepDecayOptimizerConfig"]
 
 
 @dataclass
@@ -109,7 +109,71 @@ class FSDPOptimizerConfig(OptimizerConfig):
                 "`warmup_style` is deprecated, use `lr_scheduler_type` instead.", DeprecationWarning, stacklevel=2
             )
             self.lr_scheduler_type = self.warmup_style
-        assert self.lr_scheduler_type in ["constant", "cosine"]
+        # Support "adaptive_step_decay" as valid type
+        valid_types = ["constant", "cosine", "adaptive_step_decay"]
+        if self.lr_scheduler_type not in valid_types:
+            raise ValueError(f"lr_scheduler_type must be one of {valid_types}, got {self.lr_scheduler_type}")
+        return super().__post_init__()
+
+
+@dataclass
+class AdaptiveStepDecayOptimizerConfig(FSDPOptimizerConfig):
+    """Adaptive Step-Decay optimizer configuration.
+
+    Extends FSDPOptimizerConfig with parameters for response length
+    surge detection and dynamic LR decay. This scheduler is designed
+    to stabilize RL training by detecting response length surge and
+    triggering LR decay to prevent training collapse.
+
+    Algorithm (from paper arXiv:2602.01826v1):
+    1. Monitor response_length/mean during training
+    2. Detect surge when response_length > surge_threshold * baseline
+    3. Set decay_period = 1.8 * surge_step
+    4. Halve LR every decay_period steps until reaching min_lr_ratio * initial LR
+
+    Args:
+        lr_scheduler_type (str): Must be "adaptive_step_decay".
+        decay_period (int): Steps between LR halving. -1 means auto-compute from surge.
+            After surge detection: decay_period = 1.8 * surge_step.
+        min_lr_ratio (float): Minimum LR ratio (default 0.1, i.e., 10% of initial LR).
+        surge_threshold_multiplier (float): Response length surge threshold multiplier.
+            Surge is detected when response_length > baseline * surge_threshold_multiplier.
+        surge_baseline_window (int): Number of steps to compute baseline response length.
+        surge_cooldown_steps (int): Minimum steps between surge detections to avoid noise.
+        surge_detected (bool): Whether surge has been detected. Set to True after detection.
+        surge_step (int): The step at which surge was detected. -1 means not yet detected.
+    """
+
+    _mutable_fields = FSDPOptimizerConfig._mutable_fields.copy()
+    _mutable_fields.update({"decay_period", "surge_detected", "surge_step"})
+
+    lr_scheduler_type: str = "adaptive_step_decay"
+    decay_period: int = -1  # Auto-computed: 1.8 * surge_step
+    min_lr_ratio: float = 0.1
+    surge_threshold_multiplier: float = 3.0
+    surge_baseline_window: int = 50  # Steps to compute baseline
+    surge_cooldown_steps: int = 50
+    surge_detected: bool = False
+    surge_step: int = -1
+
+    def __post_init__(self):
+        if self.lr_scheduler_type != "adaptive_step_decay":
+            warnings.warn(
+                f"AdaptiveStepDecayOptimizerConfig created with lr_scheduler_type={self.lr_scheduler_type}, "
+                f"overriding to 'adaptive_step_decay'",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.lr_scheduler_type = "adaptive_step_decay"
+        assert self.min_lr_ratio > 0 and self.min_lr_ratio < 1.0, (
+            f"min_lr_ratio must be between 0 and 1 (exclusive), got {self.min_lr_ratio}"
+        )
+        assert self.surge_threshold_multiplier > 1.0, (
+            f"surge_threshold_multiplier must be > 1.0, got {self.surge_threshold_multiplier}"
+        )
+        assert self.surge_baseline_window > 0, (
+            f"surge_baseline_window must be > 0, got {self.surge_baseline_window}"
+        )
         return super().__post_init__()
 
 
